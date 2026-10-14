@@ -18,6 +18,7 @@
 
 import net from 'node:net';
 import { type ChildProcess, spawn } from 'node:child_process';
+import { HttpRequestInterceptor } from '/@/bridge/http-request-interceptor';
 
 /**
  * Windows named pipe path used by the WSLC Docker bridge.
@@ -25,27 +26,29 @@ import { type ChildProcess, spawn } from 'node:child_process';
  */
 export const WSLC_DOCKER_PIPE_PATH = '\\\\.\\pipe\\podman-desktop-wslc';
 
+interface BridgedConnection {
+  client: net.Socket;
+  child: ChildProcess;
+  interceptor: HttpRequestInterceptor;
+}
+
 /**
  * Creates a Windows named pipe server that bridges Docker API traffic
- * to the WSLC guest's Docker daemon using a single persistent
- * `wslc.exe system session run docker system dial-stdio` child process
- * per Podman Desktop session.
+ * to the WSLC guest's Docker daemon.
  *
- * When the bridge starts it spawns one `wslc.exe` process whose stdio
- * is connected to the Docker daemon inside WSL.  The named pipe server
- * accepts one active client at a time (Podman Desktop's Docker API
- * client) and forwards traffic bidirectionally through that single
- * child process.  If the child dies it is respawned on the next
- * incoming connection.
+ * Each client connection gets its own
+ * `wslc.exe system session run docker system dial-stdio` child process.
+ * That matches how Docker remote contexts use dial-stdio (one stdio
+ * session per TCP/npipe connection) and avoids "socket hang up" when
+ * Podman Desktop opens concurrent API connections or when dial-stdio
+ * exits after `Connection: close`.
  *
- * This replaces the need for an external bridge executable (like
- * socktainer in the Apple Container extension) by using Node.js native
- * npipe support.
+ * Client→daemon bytes are intercepted so Docker API HTTP requests can
+ * be logged (method + URL) without modifying the stream.
  */
 export class WslcDockerBridge {
   #server: net.Server | undefined;
-  #child: ChildProcess | undefined;
-  #activeClient: net.Socket | undefined;
+  #connections = new Set<BridgedConnection>();
   #pipePath: string;
 
   constructor(pipePath: string = WSLC_DOCKER_PIPE_PATH) {
@@ -60,14 +63,15 @@ export class WslcDockerBridge {
     return this.#server?.listening === true;
   }
 
-  /**
-   * Spawns (or respawns) the single `wslc.exe` child process.
-   * If a previous child is still alive it is killed first.
-   */
-  spawnChild(): void {
-    this.#child?.kill();
+  get activeConnections(): number {
+    return this.#connections.size;
+  }
 
-    this.#child = spawn(
+  /**
+   * Spawns a `wslc.exe` dial-stdio child for one client connection.
+   */
+  protected spawnChild(): ChildProcess {
+    const child = spawn(
       'wslc.exe',
       ['system', 'session', 'run', 'docker', 'system', 'dial-stdio'],
       {
@@ -76,75 +80,118 @@ export class WslcDockerBridge {
       },
     );
 
-    this.#child.stderr?.on('data', (data: Buffer) => {
+    child.stderr?.on('data', (data: Buffer) => {
       console.error(`[wslc stderr]: ${data.toString()}`);
     });
 
-    this.#child.on('close', code => {
+    return child;
+  }
+
+  protected attachClient(clientSocket: net.Socket): void {
+    const child = this.spawnChild();
+    const interceptor = new HttpRequestInterceptor((method, url) => {
+      console.log(`[wslc-bridge] ${method} ${url}`);
+    });
+
+    const connection: BridgedConnection = { client: clientSocket, child, interceptor };
+    this.#connections.add(connection);
+
+    const detach = (): boolean => {
+      if (!this.#connections.has(connection)) {
+        return false;
+      }
+      this.#connections.delete(connection);
+      interceptor.reset();
+      child.stdout?.unpipe(clientSocket);
+      return true;
+    };
+
+    // Client went away: stop the dial-stdio session for this connection only
+    const onClientGone = (): void => {
+      if (!detach()) {
+        return;
+      }
+      if (!child.killed && child.exitCode === null) {
+        child.kill();
+      }
+    };
+
+    // dial-stdio exited (normal after Connection: close): finish the client gracefully
+    child.on('close', code => {
       console.log(`wslc process exited with code ${code}`);
-      this.#child = undefined;
-      // Backend died — tear down the active client so Podman Desktop
-      // knows the connection is gone and can reconnect.
-      this.#activeClient?.destroy();
-      this.#activeClient = undefined;
+      if (!detach()) {
+        return;
+      }
+      if (!clientSocket.destroyed) {
+        clientSocket.end();
+      }
+    });
+
+    // Intercept client→daemon traffic to log HTTP requests, then forward
+    clientSocket.on('data', (chunk: Buffer) => {
+      interceptor.push(chunk);
+      if (!child.stdin || child.stdin.destroyed) {
+        return;
+      }
+      const ok = child.stdin.write(chunk);
+      if (!ok) {
+        clientSocket.pause();
+        child.stdin.once('drain', () => {
+          clientSocket.resume();
+        });
+      }
+    });
+
+    // end: true so Connection: close / dial-stdio exit finishes the HTTP client cleanly
+    child.stdout?.pipe(clientSocket);
+
+    clientSocket.on('error', error => {
+      console.error('[wslc-bridge] client socket error', error);
+      onClientGone();
+    });
+
+    child.on('error', error => {
+      console.error('[wslc-bridge] child process error', error);
+      if (!detach()) {
+        return;
+      }
+      if (!clientSocket.destroyed) {
+        clientSocket.destroy();
+      }
+    });
+
+    clientSocket.on('close', () => {
+      onClientGone();
     });
   }
 
   /**
-   * Starts the named pipe server and the backing `wslc.exe` process.
-   *
-   * Only one client connection is active at a time.  When a new client
-   * connects any previous client is disconnected.  If the child process
-   * has exited it is automatically respawned for the new connection.
+   * Starts the named pipe server. dial-stdio children are created per client.
    */
   async start(): Promise<void> {
     if (this.#server) {
       return;
     }
 
-    this.spawnChild();
-
     return new Promise<void>((resolve, reject) => {
       const server = net.createServer(clientSocket => {
-        // Only one active client at a time
-        if (this.#activeClient) {
-          this.#activeClient.destroy();
-        }
-        this.#activeClient = clientSocket;
-
-        // Respawn child if it died since last connection
-        if (!this.#child || this.#child.exitCode !== undefined) {
-          this.spawnChild();
-        }
-
-        const child = this.#child!;
-        clientSocket.pipe(child.stdin!, { end: false });
-        child.stdout!.pipe(clientSocket, { end: false });
-
-        clientSocket.on('error', () => {
-          child.stdout!.unpipe(clientSocket);
-        });
-
-        clientSocket.on('close', () => {
-          if (this.#activeClient === clientSocket) {
-            this.#activeClient = undefined;
-          }
-          child.stdout!.unpipe(clientSocket);
-        });
+        this.attachClient(clientSocket);
       });
 
       server.on('error', (error: NodeJS.ErrnoException) => {
         if (error.code === 'EADDRINUSE') {
           console.warn('Named pipe already in use, attempting cleanup...');
-          net.connect(this.#pipePath, () => {
-            reject(new Error(`Named pipe ${this.#pipePath} is already in use by another process`));
-          }).on('error', () => {
-            // Pipe is stale — remove and retry
-            server.listen(this.#pipePath, () => {
-              this.#server = server;
-              resolve();
+          net
+            .connect(this.#pipePath, () => {
+              reject(new Error(`Named pipe ${this.#pipePath} is already in use by another process`));
+            })
+            .on('error', () => {
+              // Pipe is stale — remove and retry
+              server.listen(this.#pipePath, () => {
+                this.#server = server;
+                resolve();
+              });
             });
-          });
         } else {
           reject(error);
         }
@@ -158,14 +205,19 @@ export class WslcDockerBridge {
   }
 
   /**
-   * Stops the named pipe server, kills the child process, and cleans up.
+   * Stops the named pipe server, kills active children, and cleans up.
    */
   async stop(): Promise<void> {
-    this.#activeClient?.destroy();
-    this.#activeClient = undefined;
-
-    this.#child?.kill();
-    this.#child = undefined;
+    for (const connection of [...this.#connections]) {
+      connection.interceptor.reset();
+      if (!connection.child.killed && connection.child.exitCode === null) {
+        connection.child.kill();
+      }
+      if (!connection.client.destroyed) {
+        connection.client.destroy();
+      }
+    }
+    this.#connections.clear();
 
     return new Promise<void>(resolve => {
       if (this.#server) {
